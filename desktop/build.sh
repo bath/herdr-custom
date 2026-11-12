@@ -26,7 +26,7 @@ cd "$src"
 git am --abort 2>/dev/null || true
 git fetch --quiet --tags origin
 git checkout --quiet --detach "$base"
-git -c user.name=herdr-custom -c user.email=herdr-custom@localhost am --quiet "$here"/patches/*.patch
+git -c user.name=shepherd -c user.email=shepherd@localhost am --quiet "$here"/patches/*.patch
 git submodule update --init --recursive
 
 # Homebrew's rustup does not proxy `cargo +<version>`: put that toolchain first.
