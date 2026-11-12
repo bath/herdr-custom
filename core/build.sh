@@ -22,7 +22,7 @@ cd "$src"
 git am --abort 2>/dev/null || true
 git fetch --quiet origin
 git checkout --quiet --detach "$base"
-git -c user.name=herdr-custom -c user.email=herdr-custom@localhost am --quiet "$here"/patches/*.patch
+git -c user.name=sheperd -c user.email=sheperd@localhost am --quiet "$here"/patches/*.patch
 git submodule update --init --depth 1
 
 # Put the pinned toolchain's own bin first: Homebrew's rustup does not proxy
