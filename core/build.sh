@@ -35,5 +35,7 @@ case "$zigv" in 0.16.*) ;; *) echo "need Zig 0.16, got $zigv" >&2; exit 1 ;; esa
 
 cargo build --locked --release -p herdr-core
 bin="$src/target/release/herdr-core"
-grep -aq "Add the bytes to the end of this file" "$bin" || { echo "patch missing from build" >&2; exit 1; }
+for mark in "Add the bytes to the end of this file" "has no files to send"; do
+  grep -aq "$mark" "$bin" || { echo "patch missing from build: $mark" >&2; exit 1; }
+done
 echo "$bin"

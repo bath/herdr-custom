@@ -16,9 +16,20 @@ Patches on top of [herdrdev/herdr-core](https://github.com/herdrdev/herdr-core).
   drop_dir = "/home/miller/file-drop"
   ```
 
+- `hc put` sends a folder (patch 0002). Every file goes into one new folder
+  there, in the same place inside it. A second drop of the same folder goes to
+  `name-2`, so the two drops never mix. Links are not followed. Names are made
+  safe the same way as file names: a space becomes `_`.
+- `hc put --progress` prints one JSON line on stderr for each piece, which
+  Herdr Desktop (`desktop/`) shows as a % bar:
+
+  ```json
+  {"progress":{"sent":8388628,"total":20000020,"file":"photos/site 1/video.bin"}}
+  ```
+
 Both ends need the patched build: the sending `hc` splits the file, and the
-receiving core joins it. With only one end patched, files over 8 MB fail with
-an "update hc" message.
+receiving core joins it. With only one end patched, files over 8 MB and
+folders fail with an "update hc" message.
 
 ## Build
 
