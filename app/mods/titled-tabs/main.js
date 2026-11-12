@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
-import { h_flex, ScrollHandle } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
+import { h_flex, v_flex, ScrollHandle } from "gpui-base";
+import { spaces, panes, terminals, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -18,19 +18,54 @@ const words = (s) => {
   return all.length > MAX_WORDS ? `${all.slice(0, MAX_WORDS).join(" ")}…` : all.join(" ");
 };
 
-// A tab says what its work is: the name someone gave it, else the title its
-// program set (Claude Code sets a short task title), else the program and folder.
-// At most MAX_WORDS words.
-function tabTitle(tab, lead) {
-  const prog = lead?.program;
-  const raw = lead?.title ?? "";
+const REMEMBERED = 200;
+
+// A title that says what the work is: not a path, a user@host, or the program's own name.
+function telling(raw, prog) {
   const live = clean(raw);
-  const path = /^[~/]|^[A-Za-z]:\\/.test(raw.replace(/^[^\p{L}\p{N}~/]+/u, ""));
-  const telling = live && live !== prog?.name && !path && !live.includes("@") && live.toLowerCase() !== prog?.key;
-  if (tab.named && !/^tb\d+$/.test(tab.name) && tab.name !== prog?.name) return words(tab.name);
-  if (telling) return words(live);
-  const folder = lead?.cwd?.split(/[\\/]/).filter(Boolean).pop();
-  return words([prog?.name ?? "Terminal", folder].filter(Boolean).join(" · "));
+  const path = /^[~/]|^[A-Za-z]:\\/.test((raw ?? "").replace(/^[^\p{L}\p{N}~/]+/u, ""));
+  return live && live !== prog?.name && !path && !live.includes("@") && live.toLowerCase() !== prog?.key ? live : "";
+}
+
+// An agent's report while it works. "Running <command>" and "Writing /a/path"
+// name a tool call, not the work.
+const step = (msg) => {
+  const m = clean(msg);
+  return m && !/^Running\b/.test(m) && !/^\S+\s+[~.]?\//.test(m) ? m : "";
+};
+
+// The command a shell runs now: its foreground process, when that isn't the shell.
+function command(term, prog) {
+  const fg = term?.foreground;
+  if (!prog?.shell || !fg?.argv?.length || fg.pid === term.pid) return "";
+  return [fg.argv[0].split("/").pop(), ...fg.argv.slice(1)].join(" ");
+}
+
+// A tab's two lines, each at most MAX_WORDS words.
+// Line 1, what it started as: the name someone gave the tab, else a `started=`
+// label, else the first telling title seen for its terminal, else program · folder.
+// Line 2, what it does now: a `now=` label, else the agent's latest report (kept
+// after it stops), else the shell's latest command, else a word for its status.
+// `seen` remembers both per terminal, so they outlive the report and a title change.
+function lines(tab, lead, term, seen) {
+  const prog = lead?.program ?? term?.program;
+  const key = term ? `${term.address}@${term.created_ms}` : null;
+  const mine = key ? (seen[key] ??= {}) : {};
+  const title = telling(lead?.title ?? term?.title, prog);
+  if (title && !mine.start) mine.start = title;
+  const latest = step(term?.report?.msg) || command(term, prog);
+  if (latest && mine.now !== latest) mine.now = latest;
+  if (key) mine.at = term.created_ms;
+
+  const labels = term?.labels ?? {};
+  const folder = (lead?.cwd ?? term?.cwd)?.split(/[\\/]/).filter(Boolean).pop();
+  const named = tab.named && !/^tb\d+$/.test(tab.name) && tab.name !== prog?.name ? tab.name : "";
+  const first = named || clean(labels.started) || mine.start || [prog?.name ?? "Terminal", folder].filter(Boolean).join(" · ");
+  let now = clean(labels.now) || mine.now || "";
+  if (!now && prog?.agent) {
+    now = !mine.start ? "Starting…" : tab.status === "blocked" ? "Needs you" : tab.status === "working" ? "Working…" : "Waiting for your reply";
+  }
+  return [words(first), words(now)];
 }
 
 export default class Tabs extends View {
@@ -38,6 +73,18 @@ export default class Tabs extends View {
     this.pressed = null;
     this.scroll = ScrollHandle.new();
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
+    this.saved = localStorage.getItem("seen") ?? "{}";
+    this.seen = JSON.parse(this.saved);
+  }
+
+  // Keeps what lines() learned, newest REMEMBERED terminals only.
+  saveSeen() {
+    const keys = Object.keys(this.seen);
+    if (keys.length > REMEMBERED) {
+      keys.sort((a, b) => (this.seen[b].at ?? 0) - (this.seen[a].at ?? 0)).slice(REMEMBERED).forEach(k => delete this.seen[k]);
+    }
+    const text = JSON.stringify(this.seen);
+    if (text !== this.saved) { this.saved = text; localStorage.setItem("seen", text); }
   }
 
   // The side panel is remembered per space: switching shows that space's choice
@@ -82,14 +129,18 @@ export default class Tabs extends View {
     const stop = (_e, cx) => cx.stop_propagation();
     const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(label);
+    const terms = terminals();
     const item = (c, i) => {
       const lead = panes().find(p => p.tab === c.id && p.program?.agent) ?? panes().find(p => p.tab === c.id && p.terminal) ?? panes().find(p => p.tab === c.id);
       const program = lead?.program;
-      const name = tabTitle(c, lead);
-      return h_flex().id(`tab-${c.id}`).h(29).px(10).gap(7).rounded(7).items_center().flex_none().text_size(12.8)
+      const term = lead?.terminal ? terms.find(x => x.address === lead.terminal) : null;
+      const [first, now] = lines(c, lead, term, this.seen);
+      // Two lines: what it started as, then ↳ what it does now. Icon, status and
+      // close sit on line 1. In a narrow window tabs shrink to 160 px, then scroll.
+      return h_flex().id(`tab-${c.id}`).h(46).px(11).py(7).gap(8).rounded(8).items_start().flex_shrink(1).min_w(160).max_w(290)
         // A rename or status dot on this or an earlier tab can push the active one out.
         .when(i <= active, el => el.on_size_change((_size, cx) => { this.scroll.scroll_to_item(active); cx.notify(); }))
-        .border(1).border_color(c.active ? t.border : t.chrome).bg(c.active ? t.raised : t.chrome).text_color(c.active ? t.foreground : t.muted)
+        .border(1).border_color(c.active ? t.border : t.chrome).bg(c.active ? t.raised : t.chrome)
         .hover(s => s.bg(t.hover))
         .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.pressed = i; if (e.click_count === 2) run("tab.rename", { id: c.id }); })
         .on_mouse_up("left", () => {
@@ -98,11 +149,18 @@ export default class Tabs extends View {
           else run("tab.select", { id: c.id });
         })
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: c.id, space: space.id } } }); })
-        .when(Boolean(program?.icon), el => el.child(program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)))
-        .child(div().max_w(360).truncate().child(c.zoomed ? `${name} Z` : name))
-        .when(c.status === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
-        .when(c.status === "blocked" || c.status === "done", el => el.child(div().size(6).rounded(3).bg(t[c.status])))
-        .when(c.active, el => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg("mods/pane/close.svg").size(12))));
+        .when(Boolean(program?.icon), el => el.child(
+          (program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)).flex_none().mt(2)))
+        .child(v_flex().flex_1().min_w(0).gap(3)
+          .child(h_flex().min_w(0).gap(7).items_center()
+            .child(div().min_w(0).truncate().text_size(13).line_height("16px").font_weight(c.active ? 600 : 500).text_color(t.foreground)
+              .child(c.zoomed ? `${first} Z` : first))
+            .when(c.status === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
+            .when(c.status === "blocked" || c.status === "done", el => el.child(div().size(6).flex_none().rounded(3).bg(t[c.status]))))
+          .when(Boolean(now), el => el.child(h_flex().min_w(0).gap(4).items_center()
+            .child(svg("mods/titled-tabs/arrow.svg").size(11).flex_none().text_color(t.muted))
+            .child(div().min_w(0).truncate().text_size(11.5).line_height("13px").text_color(t.muted).child(now)))))
+        .when(c.active, el => el.child(div().id(`close-${c.id}`).flex_none().mt(3).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg("mods/pane/close.svg").size(12))));
     };
     const root = layout(), sidebar = find(root, "sidebar"), w = window();
     // Old saved rails and a dragged-narrow sidebar can be smaller than the window buttons.
@@ -122,12 +180,14 @@ export default class Tabs extends View {
           else { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
         }).child(svg(icon).size(14)).child(label);
     };
+    const items = shown.map(item);
+    this.saveSeen();
     return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
       .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().track_scroll(this.scroll)
         .on_size_change((_size, cx) => { if (active >= 0) { this.scroll.scroll_to_item(active); cx.notify(); } })
-        .children(shown.map(item)))
+        .children(items))
       .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
       .when(enabled.includes("files"), el => el.child(panelButton("files", "Files", "mods/files/file.svg")))
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))
