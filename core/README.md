@@ -24,8 +24,12 @@ Patches on top of [herdrdev/herdr-core](https://github.com/herdrdev/herdr-core).
   Herdr Desktop (`desktop/`) shows as a % bar:
 
   ```json
-  {"progress":{"sent":8388628,"total":20000020,"file":"photos/site 1/video.bin"}}
+  {"progress":{"sent":8388628,"total":20000020,"file":"photos/site 1/video.bin","path":"/home/miller/file-drop/rom_data"}}
   ```
+
+  `path` (patch 0003) is where the item lands: the file, or the new folder.
+  It is there from the first piece on, so Herdr Desktop can remove a
+  cancelled send.
 
 Both ends need the patched build: the sending `hc` splits the file, and the
 receiving core joins it. With only one end patched, files over 8 MB and

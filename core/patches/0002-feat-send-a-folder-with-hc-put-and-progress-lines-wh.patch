@@ -1,7 +1,7 @@
 From 1ba258f903c6c309e60a792950dd29f96a671db9 Mon Sep 17 00:00:00 2001
 From: Miller Bath <millerzbath@gmail.com>
 Date: Thu, 12 Nov 2026 11:40:54 -0600
-Subject: [PATCH 2/2] feat: send a folder with hc put, and --progress lines
+Subject: [PATCH 2/3] feat: send a folder with hc put, and --progress lines
  while sending
 
 hc put sends a folder file by file into one new folder there (name-2,
