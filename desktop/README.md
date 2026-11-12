@@ -11,8 +11,14 @@ machine:
 - each item goes there in turn, with `hc put --progress` (a folder too);
 - a small card in the pane's bottom-right corner lists every item: "Queued",
   then a thin bar with a %, then ✓ (or ✕ and the reason);
-- the card says "Sending 2 of 5 to <machine>", then "Sent 5 to <machine>",
-  and it goes 10 s after the last item. A new drop in that time joins it;
+- the card says "Sending 2 of 5 to <machine>", then "Sent 5 to <machine>"
+  (or "Sent 3, cancelled 1, failed 1 to <machine>"), and it goes 10 s after
+  the last item. A new drop in that time joins it;
+- × on a queued or sending row cancels it, and "Cancel all" in the header
+  cancels what is left. A queued item never starts. For the sending one, `hc
+  put` is stopped, its path is not typed, and the part that arrived is removed
+  there (`hc exec --on <machine> -- rm -rf -- <path>`, only for the path that
+  hc reported for that item);
 - each item's path there is typed at the prompt when it arrives, as before.
 
 It needs the patched `hc` from `core/` on both machines. With the official

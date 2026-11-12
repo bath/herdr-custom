@@ -1,0 +1,624 @@
+From 14d6cb3bdebdc226bf264dc27c8e6dbfa7267491 Mon Sep 17 00:00:00 2001
+From: Miller Bath <millerzbath@gmail.com>
+Date: Thu, 12 Nov 2026 12:04:40 -0600
+Subject: [PATCH 2/2] feat: cancel a transfer to a remote terminal, or all of
+ them
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Each queued or sending row has a ×, and the header has Cancel all. A
+queued item never starts; the sending one's hc put is killed, its path is
+not pasted, and what part of it arrived (the path hc's progress named) is
+removed there with hc exec rm -rf. The header counts cancelled items.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/terminal.rs          |  46 ++++--
+ src/terminal/transfer.rs | 330 +++++++++++++++++++++++++++++++++------
+ 2 files changed, 314 insertions(+), 62 deletions(-)
+
+diff --git a/src/terminal.rs b/src/terminal.rs
+index 270ce8f..13b5e5b 100644
+--- a/src/terminal.rs
++++ b/src/terminal.rs
+@@ -667,15 +667,16 @@ impl TerminalView {
+         }
+         let addr = self.address.clone();
+         cx.spawn(async move |this, cx| {
+-            while let Some((i, path, copy)) = this.update(cx, |this, _| this.transfers.next()).ok().flatten() {
++            while let Some((i, path, copy, stop)) = this.update(cx, |this, _| this.transfers.next()).ok().flatten() {
+                 let (tx, rx) = async_channel::unbounded();
+                 let to = addr.clone();
+                 let job = cx.background_executor().spawn(async move {
+                     let mut last: Option<Instant> = None;
+-                    let sent = transfer::put(&to, &path, |sent, total| {
+-                        if last.is_none_or(|t| t.elapsed() >= transfer::TICK) || Some(sent) == total {
++                    let sent = transfer::put(&to, &path, &stop, |sent, total, there| {
++                        let due = last.is_none_or(|t| t.elapsed() >= transfer::TICK) || Some(sent) == total;
++                        if due || there.is_some() {
+                             last = Some(Instant::now());
+-                            let _ = tx.try_send(transfer::State::Sending { sent, total });
++                            let _ = tx.try_send((sent, total, there));
+                         }
+                     });
+                     if copy {
+@@ -683,24 +684,28 @@ impl TerminalView {
+                     }
+                     sent
+                 });
+-                while let Ok(state) = rx.recv().await {
++                while let Ok((sent, total, there)) = rx.recv().await {
+                     let _ = this.update(cx, |this, cx| {
+-                        this.transfers.set(i, state);
++                        this.transfers.progress(i, sent, total, there);
+                         cx.notify();
+                     });
+                 }
+                 let sent = job.await;
+-                let _ = this.update(cx, |this, cx| {
+-                    match sent {
+-                        Ok(there) => {
+-                            let bytes = this.grid.borrow().vt.paste_bytes(&quote_paths([there]));
++                let finish = this
++                    .update(cx, |this, cx| {
++                        let finish = this.transfers.finish(i, sent);
++                        if let transfer::Finish::Paste(there) = &finish {
++                            let bytes = this.grid.borrow().vt.paste_bytes(&quote_paths([there.clone()]));
+                             this.send(&bytes);
+-                            this.transfers.set(i, transfer::State::Done);
+                         }
+-                        Err(why) => this.transfers.set(i, transfer::State::Failed(why)),
+-                    }
+-                    cx.notify();
+-                });
++                        cx.notify();
++                        finish
++                    })
++                    .unwrap_or(transfer::Finish::Nothing);
++                if let transfer::Finish::Remove(there) = finish {
++                    let to = addr.clone();
++                    cx.background_executor().spawn(async move { transfer::remove_there(&to, &there) }).detach();
++                }
+             }
+             let Ok(generation) = this.update(cx, |this, _| this.transfers.generation) else { return };
+             cx.background_executor().timer(transfer::LINGER).await;
+@@ -712,6 +717,15 @@ impl TerminalView {
+         .detach();
+     }
+ 
++    /// Cancels transfer `which` (none: all of them) if it hasn't finished.
++    fn cancel_transfer(&mut self, which: Option<usize>, cx: &mut Context<Self>) {
++        match which {
++            Some(i) => self.transfers.cancel(i),
++            None => self.transfers.cancel_all(),
++        }
++        cx.notify();
++    }
++
+     /// Text as a paste; copied files (Finder, a clipboard manager's image) as
+     /// if dropped; an image alone (a screenshot) as Ctrl+V pastes it.
+     pub fn paste(&mut self, cx: &mut Context<Self>) {
+@@ -2161,7 +2175,7 @@ impl Render for TerminalView {
+         let (input_focus, input_view) = (self.focus.clone(), cx.entity());
+         let ended = self.ended.clone().or_else(|| self.lost.then(|| "reconnecting to core…".to_owned()));
+         let search_input = self.search_open.then(|| self.search_input.clone()).flatten();
+-        let transfers = transfer::card(&self.transfers, &self.address);
++        let transfers = transfer::card(&self.transfers, &self.address.clone(), cx);
+         let search_progress = self.grid.borrow().vt.search_progress();
+         let search_label = if self.search_query.is_empty() {
+             String::new()
+diff --git a/src/terminal/transfer.rs b/src/terminal/transfer.rs
+index e6005ec..5deae78 100644
+--- a/src/terminal/transfer.rs
++++ b/src/terminal/transfer.rs
+@@ -3,9 +3,10 @@
+ 
+ use gpui::prelude::FluentBuilder as _;
+ use gpui::*;
+-use std::io::{BufRead, BufReader};
++use std::io::{BufRead, BufReader, Read};
+ use std::path::{Path, PathBuf};
+-use std::process::Stdio;
++use std::process::{Child, Stdio};
++use std::sync::{Arc, Mutex, PoisonError};
+ use std::time::Duration;
+ 
+ /// How long the card stays after the last item is sent.
+@@ -20,6 +21,7 @@ pub enum State {
+     Sending { sent: u64, total: Option<u64> },
+     Done,
+     Failed(String),
++    Cancelled,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq)]
+@@ -30,6 +32,49 @@ pub struct Item {
+     path: PathBuf,
+     /// The local file was only made for sending (a pasted image): removed after.
+     copy: bool,
++    /// Where it lands there, once hc's progress says so: what a cancel removes.
++    there: Option<String>,
++}
++
++/// Stops one running `hc put`: kills it, or the next one it would start.
++#[derive(Clone, Default)]
++pub struct Stop(Arc<Mutex<(bool, Option<Child>)>>);
++
++impl Stop {
++    pub fn stop(&self) {
++        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
++        held.0 = true;
++        if let Some(child) = held.1.as_mut() {
++            let _ = child.kill();
++        }
++    }
++
++    fn stopped(&self) -> bool {
++        self.0.lock().unwrap_or_else(PoisonError::into_inner).0
++    }
++
++    /// Keeps `child` to kill; a stop that came first kills it at once.
++    fn hold(&self, mut child: Child) {
++        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
++        if held.0 {
++            let _ = child.kill();
++        }
++        held.1 = Some(child);
++    }
++
++    fn take(&self) -> Option<Child> {
++        self.0.lock().unwrap_or_else(PoisonError::into_inner).1.take()
++    }
++}
++
++/// What to do once an item's `hc put` has ended.
++#[derive(Debug, PartialEq)]
++pub enum Finish {
++    /// It arrived: type its path there.
++    Paste(String),
++    /// It was cancelled: remove what part of it arrived, at this path there.
++    Remove(String),
++    Nothing,
+ }
+ 
+ /// One terminal's drops, oldest first.
+@@ -40,6 +85,8 @@ pub struct Transfers {
+     pub sending: bool,
+     /// Bumped by each drop, so an older drop's wait doesn't hide a newer one.
+     pub generation: u64,
++    /// The item sending now, and how to stop it.
++    current: Option<(usize, Stop)>,
+ }
+ 
+ impl Transfers {
+@@ -55,23 +102,73 @@ impl Transfers {
+             state: State::Queued,
+             path,
+             copy,
++            there: None,
+         }));
+     }
+ 
+     /// The next queued item, now sending; none: the sending task stops.
+-    pub fn next(&mut self) -> Option<(usize, PathBuf, bool)> {
++    pub fn next(&mut self) -> Option<(usize, PathBuf, bool, Stop)> {
+         let Some(i) = self.items.iter().position(|item| item.state == State::Queued) else {
+             self.sending = false;
++            self.current = None;
+             return None;
+         };
+         let item = &mut self.items[i];
+         item.state = State::Sending { sent: 0, total: None };
+-        Some((i, item.path.clone(), item.copy))
++        let stop = Stop::default();
++        self.current = Some((i, stop.clone()));
++        Some((i, item.path.clone(), item.copy, stop))
++    }
++
++    /// hc's progress for item `i`. Where it lands is kept even after a cancel.
++    pub fn progress(&mut self, i: usize, sent: u64, total: Option<u64>, there: Option<String>) {
++        let Some(item) = self.items.get_mut(i) else { return };
++        if there.is_some() {
++            item.there = there;
++        }
++        if let State::Sending { .. } = item.state {
++            item.state = State::Sending { sent, total };
++        }
++    }
++
++    /// Item `i`'s `hc put` ended with `sent`.
++    pub fn finish(&mut self, i: usize, sent: Result<String, String>) -> Finish {
++        if self.current.as_ref().is_some_and(|(at, _)| *at == i) {
++            self.current = None;
++        }
++        let Some(item) = self.items.get_mut(i) else { return Finish::Nothing };
++        if item.state == State::Cancelled {
++            return item.there.take().map_or(Finish::Nothing, Finish::Remove);
++        }
++        match sent {
++            Ok(there) => {
++                item.state = State::Done;
++                Finish::Paste(there)
++            }
++            Err(why) => {
++                item.state = State::Failed(why);
++                Finish::Nothing
++            }
++        }
++    }
++
++    /// Cancels item `i` if it is queued or sending; a sending one's hc is killed.
++    pub fn cancel(&mut self, i: usize) {
++        let Some(item) = self.items.get_mut(i) else { return };
++        if !matches!(item.state, State::Queued | State::Sending { .. }) {
++            return;
++        }
++        item.state = State::Cancelled;
++        if let Some((at, stop)) = &self.current
++            && *at == i
++        {
++            stop.stop();
++        }
+     }
+ 
+-    pub fn set(&mut self, i: usize, state: State) {
+-        if let Some(item) = self.items.get_mut(i) {
+-            item.state = state;
++    pub fn cancel_all(&mut self) {
++        for i in 0..self.items.len() {
++            self.cancel(i);
+         }
+     }
+ 
+@@ -90,7 +187,8 @@ impl Transfers {
+ /// One line `hc put --progress` writes to stderr.
+ #[derive(Debug, PartialEq)]
+ pub enum Line {
+-    Progress { sent: u64, total: u64 },
++    /// `there`: where it lands, once hc knows (after the first piece).
++    Progress { sent: u64, total: u64, there: Option<String> },
+     Error(String),
+     Text(String),
+ }
+@@ -98,7 +196,11 @@ pub enum Line {
+ pub fn parse_line(line: &str) -> Line {
+     let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+     if let Some(p) = v.get("progress") {
+-        return Line::Progress { sent: p["sent"].as_u64().unwrap_or(0), total: p["total"].as_u64().unwrap_or(0) };
++        return Line::Progress {
++            sent: p["sent"].as_u64().unwrap_or(0),
++            total: p["total"].as_u64().unwrap_or(0),
++            there: p["path"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
++        };
+     }
+     if let Some(message) = v["error"]["message"].as_str() {
+         return Line::Error(match v["error"]["hint"].as_str().filter(|h| !h.is_empty()) {
+@@ -120,19 +222,19 @@ pub fn answer(stdout: &[u8], lines: &[Line]) -> Result<String, String> {
+     Err(error.or_else(text).unwrap_or_else(|| "hc put gave no path".to_owned()))
+ }
+ 
+-/// Sends `path` to the machine of terminal `addr`, reporting (sent, total) as
+-/// it goes. An hc from before `--progress` sends it without.
+-pub fn put(addr: &str, path: &Path, mut progress: impl FnMut(u64, Option<u64>)) -> Result<String, String> {
+-    match run(addr, path, true, &mut progress) {
+-        Err(why) if why.contains("--progress") => {
+-            progress(0, None);
+-            run(addr, path, false, &mut progress)
++/// Sends `path` to the machine of terminal `addr`, reporting (sent, total,
++/// where it lands) as it goes. An hc from before `--progress` sends it without.
++pub fn put(addr: &str, path: &Path, stop: &Stop, mut progress: impl FnMut(u64, Option<u64>, Option<String>)) -> Result<String, String> {
++    match run(addr, path, true, stop, &mut progress) {
++        Err(why) if why.contains("--progress") && !stop.stopped() => {
++            progress(0, None, None);
++            run(addr, path, false, stop, &mut progress)
+         }
+         sent => sent,
+     }
+ }
+ 
+-fn run(addr: &str, path: &Path, with_progress: bool, progress: &mut impl FnMut(u64, Option<u64>)) -> Result<String, String> {
++fn run(addr: &str, path: &Path, with_progress: bool, stop: &Stop, progress: &mut impl FnMut(u64, Option<u64>, Option<String>)) -> Result<String, String> {
+     let mut cmd = crate::spawn::command(crate::core_bin::path());
+     cmd.args(["put", "--json"]);
+     if with_progress {
+@@ -140,38 +242,87 @@ fn run(addr: &str, path: &Path, with_progress: bool, progress: &mut impl FnMut(u
+     }
+     cmd.arg(addr).arg(path).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
++    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
++    stop.hold(child);
+     let mut lines = Vec::new();
+-    if let Some(stderr) = child.stderr.take() {
++    if let Some(stderr) = stderr {
+         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+             match parse_line(&line) {
+-                Line::Progress { sent, total } => progress(sent, Some(total)),
++                Line::Progress { sent, total, there } => progress(sent, Some(total), there),
+                 other => lines.push(other),
+             }
+         }
+     }
+-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+-    answer(&out.stdout, &lines)
++    let mut out = Vec::new();
++    if let Some(mut stdout) = stdout {
++        let _ = stdout.read_to_end(&mut out);
++    }
++    if let Some(mut child) = stop.take() {
++        let _ = child.wait();
++    }
++    if stop.stopped() {
++        return Err("cancelled".to_owned());
++    }
++    answer(&out, &lines)
++}
++
++/// Removes what part of a cancelled item reached the machine of terminal `addr`.
++/// `there` comes only from hc's own progress for that item.
++pub fn remove_there(addr: &str, there: &str) {
++    let Some((machine, _)) = addr.split_once('/') else { return };
++    if !there.starts_with('/') || there.trim_end_matches('/').is_empty() {
++        return;
++    }
++    let _ = crate::spawn::command(crate::core_bin::path())
++        .args(["exec", "--on", machine, "--", "rm", "-rf", "--", there])
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null())
++        .status();
++}
++
++/// The card's header: how far the list has come.
++pub fn title(transfers: &Transfers, machine: &str) -> String {
++    let count = |f: fn(&State) -> bool| transfers.items.iter().filter(|i| f(&i.state)).count();
++    let done = count(|s| *s == State::Done);
++    let failed = count(|s| matches!(s, State::Failed(_)));
++    let cancelled = count(|s| *s == State::Cancelled);
++    if transfers.busy() {
++        let left = count(|s| matches!(s, State::Queued | State::Sending { .. }));
++        let count = transfers.items.len() - cancelled;
++        return format!("Sending {} of {count} to {machine}", count - left + 1);
++    }
++    let mut parts = vec![format!("Sent {done}")];
++    if cancelled > 0 {
++        parts.push(format!("cancelled {cancelled}"));
++    }
++    if failed > 0 {
++        parts.push(format!("failed {failed}"));
++    }
++    format!("{} to {machine}", parts.join(", "))
+ }
+ 
+ /// The card over the pane: one row per item, the one sending with a bar.
+-pub fn card(transfers: &Transfers, address: &str) -> Option<AnyElement> {
++pub fn card(transfers: &Transfers, address: &str, cx: &mut Context<super::TerminalView>) -> Option<AnyElement> {
+     if transfers.items.is_empty() {
+         return None;
+     }
+     let color = crate::settings::color;
+     let machine = address.split_once('/').map_or(address, |(m, _)| m);
+-    let count = transfers.items.len();
+-    let done = transfers.items.iter().filter(|i| i.state == State::Done).count();
+-    let failed = transfers.items.iter().filter(|i| matches!(i.state, State::Failed(_))).count();
+-    let title = if transfers.busy() {
+-        let at = done + failed + 1;
+-        format!("Sending {at} of {count} to {machine}")
+-    } else if failed == 0 {
+-        format!("Sent {count} to {machine}")
+-    } else {
+-        format!("Sent {done} of {count} to {machine}")
++    let stop_click = |_: &MouseDownEvent, _: &mut Window, cx: &mut App| cx.stop_propagation();
++    let cancel = |id: SharedString, label: &'static str| {
++        div()
++            .id(id)
++            .flex_none()
++            .px_1()
++            .rounded_sm()
++            .text_color(color("dim"))
++            .hover(|d| d.text_color(color("foreground")).bg(color("hover")))
++            .cursor_pointer()
++            .on_mouse_down(MouseButton::Left, stop_click)
++            .child(label)
+     };
+-    let rows = transfers.items.iter().map(|item| {
++    let rows = transfers.items.iter().enumerate().map(|(i, item)| {
+         let name = if item.folder { format!("{}/", item.name) } else { item.name.clone() };
+         let (mark, mark_color) = match &item.state {
+             State::Queued => ("Queued".to_owned(), color("muted")),
+@@ -179,6 +330,7 @@ pub fn card(transfers: &Transfers, address: &str) -> Option<AnyElement> {
+             State::Sending { .. } => ("…".to_owned(), color("muted")),
+             State::Done => ("✓".to_owned(), color("done")),
+             State::Failed(_) => ("✕".to_owned(), color("blocked")),
++            State::Cancelled => ("Cancelled".to_owned(), color("muted")),
+         };
+         let bar = match item.state {
+             State::Sending { sent, total: Some(total) } if total > 0 => Some((sent as f32 / total as f32).clamp(0.0, 1.0)),
+@@ -186,6 +338,7 @@ pub fn card(transfers: &Transfers, address: &str) -> Option<AnyElement> {
+             _ => None,
+         };
+         let known = matches!(item.state, State::Sending { total: Some(t), .. } if t > 0);
++        let open = matches!(item.state, State::Queued | State::Sending { .. });
+         div()
+             .flex()
+             .flex_col()
+@@ -196,7 +349,13 @@ pub fn card(transfers: &Transfers, address: &str) -> Option<AnyElement> {
+                     .items_center()
+                     .gap_2()
+                     .child(div().flex_1().min_w_0().truncate().text_color(color("foreground")).child(name))
+-                    .child(div().flex_none().text_color(mark_color).child(mark)),
++                    .child(div().flex_none().text_color(mark_color).child(mark))
++                    .when(open, |d| {
++                        d.child(
++                            cancel(SharedString::from(format!("transfer-cancel-{address}-{i}")), "×")
++                                .on_click(cx.listener(move |this, _, _, cx| this.cancel_transfer(Some(i), cx))),
++                        )
++                    }),
+             )
+             .when_some(bar, |d, fraction| {
+                 d.child(
+@@ -209,6 +368,7 @@ pub fn card(transfers: &Transfers, address: &str) -> Option<AnyElement> {
+                 d.child(div().truncate().text_color(color("muted")).child(why))
+             })
+     });
++    let rows: Vec<_> = rows.collect();
+     Some(
+         div()
+             .id(SharedString::from(format!("transfers-{address}")))
+@@ -227,8 +387,20 @@ pub fn card(transfers: &Transfers, address: &str) -> Option<AnyElement> {
+             .bg(color("popover"))
+             .shadow_md()
+             .text_xs()
+-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+-            .child(div().text_color(color("muted")).child(title))
++            .on_mouse_down(MouseButton::Left, stop_click)
++            .child(
++                div()
++                    .flex()
++                    .items_center()
++                    .gap_2()
++                    .child(div().flex_1().min_w_0().truncate().text_color(color("muted")).child(title(transfers, machine)))
++                    .when(transfers.busy(), |d| {
++                        d.child(
++                            cancel(SharedString::from(format!("transfer-cancel-all-{address}")), "Cancel all")
++                                .on_click(cx.listener(|this, _, _, cx| this.cancel_transfer(None, cx))),
++                        )
++                    }),
++            )
+             .children(rows)
+             .into_any_element(),
+     )
+@@ -236,13 +408,20 @@ pub fn card(transfers: &Transfers, address: &str) -> Option<AnyElement> {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{Line, State, Transfers, answer, parse_line};
++    use super::{Finish, Line, State, Transfers, answer, parse_line, title};
+     use std::path::PathBuf;
+ 
+     #[test]
+     fn progress_error_and_text_lines_are_told_apart() {
+-        assert_eq!(parse_line(r#"{"progress":{"sent":8388608,"total":30000000,"file":"a/b.bin"}}"#), Line::Progress { sent: 8388608, total: 30000000 });
+-        assert_eq!(parse_line(r#"{"progress":{"sent":0,"total":0,"file":"empty"}}"#), Line::Progress { sent: 0, total: 0 });
++        assert_eq!(
++            parse_line(r#"{"progress":{"sent":8388608,"total":30000000,"file":"a/b.bin"}}"#),
++            Line::Progress { sent: 8388608, total: 30000000, there: None }
++        );
++        assert_eq!(
++            parse_line(r#"{"progress":{"sent":8388628,"total":20000020,"file":"photos/a.bin","path":"/home/miller/file-drop/rom_data"}}"#),
++            Line::Progress { sent: 8388628, total: 20000020, there: Some("/home/miller/file-drop/rom_data".to_owned()) }
++        );
++        assert_eq!(parse_line(r#"{"progress":{"sent":0,"total":0,"file":"empty","path":""}}"#), Line::Progress { sent: 0, total: 0, there: None });
+         assert_eq!(
+             parse_line(r#"{"error":{"kind":"unsupported","message":"box took only the first part","hint":"update hc"}}"#),
+             Line::Error("box took only the first part (update hc)".to_owned())
+@@ -265,7 +444,7 @@ mod tests {
+         let mut t = Transfers::default();
+         t.queue(vec!["/a/one.csv".into(), "/a/two.bin".into()], false);
+         assert_eq!(t.items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["one.csv", "two.bin"]);
+-        let (first, path, copy) = t.next().unwrap();
++        let (first, path, copy, _) = t.next().unwrap();
+         assert_eq!((first, path, copy), (0, PathBuf::from("/a/one.csv"), false));
+         assert_eq!(t.items[0].state, State::Sending { sent: 0, total: None });
+         assert_eq!(t.items[1].state, State::Queued, "one at a time");
+@@ -273,13 +452,15 @@ mod tests {
+         // A drop while sending joins the queue.
+         t.queue(vec!["/b/three.txt".into()], false);
+         assert_eq!(t.items.len(), 3);
+-        t.set(0, State::Done);
++        assert_eq!(t.finish(0, Ok("/x/one.csv".into())), Finish::Paste("/x/one.csv".into()));
++        assert_eq!(t.items[0].state, State::Done);
+         assert_eq!(t.next().map(|n| n.0), Some(1));
+-        t.set(1, State::Failed("no space".into()));
++        assert_eq!(t.finish(1, Err("no space".into())), Finish::Nothing);
++        assert_eq!(t.items[1].state, State::Failed("no space".into()));
+         assert_eq!(t.next().map(|n| n.0), Some(2));
+-        t.set(2, State::Done);
++        t.finish(2, Ok("/x/three.txt".into()));
+         t.sending = true;
+-        assert_eq!(t.next(), None);
++        assert!(t.next().is_none());
+         assert!(!t.sending, "the sending task stops when nothing is queued");
+         assert!(!t.busy());
+ 
+@@ -289,18 +470,75 @@ mod tests {
+         assert_eq!(t.items[0].name, "pasted image");
+     }
+ 
++    #[test]
++    fn a_cancelled_queued_item_never_starts() {
++        let mut t = Transfers::default();
++        t.queue(vec!["/a/one".into(), "/a/two".into(), "/a/three".into()], false);
++        t.next();
++        t.cancel(1);
++        assert_eq!(t.items[1].state, State::Cancelled);
++        t.finish(0, Ok("/x/one".into()));
++        assert_eq!(t.next().map(|n| n.0), Some(2), "the queue skips it");
++    }
++
++    #[test]
++    fn a_cancelled_sending_item_is_stopped_kept_out_and_its_part_removed() {
++        let mut t = Transfers::default();
++        t.queue(vec!["/a/rom_data".into(), "/a/next.csv".into()], false);
++        let (i, _, _, stop) = t.next().unwrap();
++        t.progress(i, 8388628, Some(20000020), Some("/home/me/file-drop/rom_data".into()));
++        assert_eq!(t.items[i].state, State::Sending { sent: 8388628, total: Some(20000020) });
++        t.cancel(i);
++        assert!(stop.stopped(), "its hc is killed");
++        assert_eq!(t.items[i].state, State::Cancelled);
++        // Progress already on its way doesn't bring it back.
++        t.progress(i, 16777256, Some(20000020), None);
++        assert_eq!(t.items[i].state, State::Cancelled);
++        // Even if hc finished first, the path isn't pasted: what arrived goes.
++        assert_eq!(t.finish(i, Ok("/home/me/file-drop/rom_data".into())), Finish::Remove("/home/me/file-drop/rom_data".into()));
++        assert_eq!(t.next().map(|n| n.0), Some(1), "the queue goes on");
++
++        // Cancelled before hc said where: nothing to remove.
++        let mut t = Transfers::default();
++        t.queue(vec!["/a/one".into()], false);
++        t.next();
++        t.cancel(0);
++        assert_eq!(t.finish(0, Err("cancelled".into())), Finish::Nothing);
++    }
++
++    #[test]
++    fn cancel_all_stops_what_is_left_and_the_header_counts_it() {
++        let mut t = Transfers::default();
++        t.queue(vec!["/a/1".into(), "/a/2".into(), "/a/3".into(), "/a/4".into(), "/a/5".into()], false);
++        for i in 0..3 {
++            t.next();
++            t.finish(i, Ok(format!("/x/{i}")));
++        }
++        let (i, _, _, stop) = t.next().unwrap();
++        assert_eq!(title(&t, "box"), "Sending 4 of 5 to box");
++        t.cancel_all();
++        assert!(stop.stopped());
++        assert!(!t.busy());
++        assert_eq!(t.items[3].state, State::Cancelled);
++        assert_eq!(t.items[4].state, State::Cancelled);
++        assert_eq!(t.items[0].state, State::Done, "finished items stay");
++        t.finish(i, Err("cancelled".into()));
++        assert!(t.next().is_none());
++        assert_eq!(title(&t, "box"), "Sent 3, cancelled 2 to box");
++    }
++
+     #[test]
+     fn the_wait_hides_the_card_only_if_no_drop_came_meanwhile() {
+         let mut t = Transfers::default();
+         t.queue(vec!["/a/one.csv".into()], false);
+         let old = t.generation;
+         t.next();
+-        t.set(0, State::Done);
++        t.finish(0, Ok("/x/one.csv".into()));
+         t.queue(vec!["/a/two.csv".into()], false);
+         t.hide(old);
+         assert_eq!(t.items.len(), 1, "a newer drop keeps the card");
+         t.next();
+-        t.set(0, State::Done);
++        t.finish(0, Ok("/x/two.csv".into()));
+         t.hide(t.generation);
+         assert!(t.items.is_empty());
+     }
+-- 
+2.54.0 (Apple Git-157)
+

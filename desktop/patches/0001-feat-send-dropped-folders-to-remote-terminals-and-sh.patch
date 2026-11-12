@@ -1,8 +1,8 @@
 From 57cb90c00748ad21aac46d31c2f775eba3fa956d Mon Sep 17 00:00:00 2001
 From: Miller Bath <millerzbath@gmail.com>
 Date: Thu, 12 Nov 2026 11:39:33 -0600
-Subject: [PATCH] feat: send dropped folders to remote terminals and show each
- transfer
+Subject: [PATCH 1/2] feat: send dropped folders to remote terminals and show
+ each transfer
 
 Files and folders dropped on another machine's terminal go one at a time
 with hc put --progress; a card over the pane lists them (queued, a bar
