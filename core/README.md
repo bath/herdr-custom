@@ -31,15 +31,31 @@ Rust 1.95 and Zig 0.16.
 
 ## Install
 
-On each machine, with the binary built for that machine:
+**Linux**, with the binary built on that machine:
 
 ```sh
 hc update --from <path printed by build.sh>
 ```
 
-On macOS, the terminal you run this from needs System Settings → Privacy &
-Security → App Management, because the installed `Herdr Core.app` is signed by
-Herdr. Without it, `hc update` says the folder "isn't writable by you".
+**macOS:**
+
+```sh
+core/install-mac.sh
+```
+
+On macOS, `hc update --from <binary>` does not work, for two reasons:
+
+- `hc update` takes only a complete signed `Herdr Core.app`. The script makes
+  one with Herdr's `scripts/mac-bundle` and signs it ad hoc with
+  `scripts/mac-sign`.
+- macOS App Management stops Ghostty, Terminal and other apps from changing
+  the installed bundle, because Herdr's team signed it. The error is "isn't
+  writable by you". The script runs `hc update` in a terminal that herdr-core
+  starts. macOS lets that process change the bundle, because Herdr's team
+  also signed it.
+
+The ad-hoc signature is not Herdr's. So macOS can ask again for privacy
+permissions (camera, microphone, files) that programs in Herdr terminals use.
 
 To go back to the official release: `hc update --force`.
 

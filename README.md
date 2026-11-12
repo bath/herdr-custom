@@ -14,6 +14,7 @@ See each folder's README for how to build, install and update:
 Quick start:
 
 ```sh
-core/build.sh                       # then: hc update --from <printed path>, on each machine
+core/build.sh                       # build hc with the file drop patch
+core/install-mac.sh                 # Mac: install it (Linux: hc update --from <printed path>)
 app/install.sh                      # Mac only: installs the titled-tabs mod and layout
 ```
