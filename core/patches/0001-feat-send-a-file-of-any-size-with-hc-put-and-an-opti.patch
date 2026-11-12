@@ -1,0 +1,288 @@
+From f9f83db5e5805e836f90a2a1336ca494946914b3 Mon Sep 17 00:00:00 2001
+From: Miller Bath <millerzbath@gmail.com>
+Date: Thu, 12 Nov 2026 16:52:14 +0000
+Subject: [PATCH] feat: send a file of any size with hc put, and an optional
+ drop_dir
+
+hc put now always sends a file in pieces of at most 8 MB: the first call
+makes the file, each later one adds to its end (`append`, the name the
+first returned). Small files are one piece, so every size goes the same
+way and Herdr's drop on a remote terminal works for big files too
+(herdrdev/herdr-app#810).
+
+A core from before `append` would make a new file per piece; hc put sees
+the second path differ and says to update hc there.
+
+`drop_dir` in config.toml puts every file in one folder that keeps them,
+instead of a folder per terminal removed with it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/herdr-core/src/api.rs       | 10 +++++---
+ crates/herdr-core/src/api/types.rs |  9 ++++++-
+ crates/herdr-core/src/cli.rs       | 36 ++++++++++++++++++++++++---
+ crates/herdr-core/src/config.rs    | 11 ++++++++
+ crates/herdr-core/src/put.rs       | 19 +++++++++++---
+ crates/herdr-core/tests/put.rs     | 40 ++++++++++++++++++++++--------
+ docs/machines.md                   |  2 +-
+ schema/hc.openrpc.json             | 17 +++++++++++--
+ 8 files changed, 118 insertions(+), 26 deletions(-)
+
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index 89711d6..615169c 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -554,9 +554,13 @@ async fn terminal_put(core: Ctx<'_>, p: PutParams) -> Result<PutResult, RpcError
+             "nothing there to read it",
+         ));
+     }
+-    let path = crate::put::stage(&core.paths.state, id, &p.name, &bytes)
+-        .map_err(|e| RpcError::internal(format!("cannot write the file: {e}")))?;
+-    Ok(PutResult { path: path.display().to_string(), bytes: bytes.len() })
++    let dir = core.settings().drop_dir()?.unwrap_or_else(|| crate::put::dir(&core.paths.state, id));
++    let (path, size) = match &p.append {
++        None => crate::put::stage(&dir, &p.name, &bytes).map(|path| (path, bytes.len() as u64)),
++        Some(name) => crate::put::append(&dir, name, &bytes),
++    }
++    .map_err(|e| RpcError::internal(format!("cannot write the file: {e}")))?;
++    Ok(PutResult { path: path.display().to_string(), bytes: size as usize })
+ }
+ 
+ async fn terminal_keys(core: Ctx<'_>, p: KeysParams) -> Result<KeysResult, RpcError> {
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index 7a2dae9..b5e8edc 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -589,15 +589,22 @@ pub struct PutParams {
+     /// The file's name, kept so `.png` stays `.png` (CLI: the local file to send).
+     #[arg(value_name = "FILE")]
+     pub name: String,
+-    /// Its bytes, base64; at most 8 MB raw.
++    /// Its bytes, base64; at most 8 MB raw per call (`hc put` sends a bigger
++    /// file in pieces).
+     #[arg(skip)]
+     pub data: String,
++    /// Add the bytes to the end of this file instead: the file name an earlier
++    /// put to this terminal returned.
++    #[arg(skip)]
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub append: Option<String>,
+ }
+ 
+ #[derive(Serialize, JsonSchema)]
+ pub struct PutResult {
+     /// Where it landed, as the terminal's machine sees it.
+     pub path: String,
++    /// Its size there now.
+     pub bytes: usize,
+ }
+ 
+diff --git a/crates/herdr-core/src/cli.rs b/crates/herdr-core/src/cli.rs
+index 2035dd5..b32eaa4 100644
+--- a/crates/herdr-core/src/cli.rs
++++ b/crates/herdr-core/src/cli.rs
+@@ -475,10 +475,38 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
+             Out { json: r, human }
+         }
+         Cmd::Put(mut p) => {
+-            let bytes = std::fs::read(&p.name)
+-                .map_err(|e| RpcError::new("usage", format!("cannot read {}: {e}", p.name), ""))?;
+-            p.data = crate::put::encode(&bytes);
+-            let r = call("terminal.put", to(&p))?;
++            let local = p.name.clone();
++            let cannot = |e: std::io::Error| RpcError::new("usage", format!("cannot read {local}: {e}"), "");
++            let mut file = std::fs::File::open(&local).map_err(cannot)?;
++            // Every file goes in pieces of at most MAX_BYTES, one call each:
++            // the first makes the file, the rest add to its end.
++            let mut r = Value::Null;
++            loop {
++                let mut piece = Vec::new();
++                (&mut file).take(crate::put::MAX_BYTES as u64).read_to_end(&mut piece).map_err(cannot)?;
++                if piece.is_empty() && p.append.is_some() {
++                    break;
++                }
++                p.data = crate::put::encode(&piece);
++                let got = call("terminal.put", to(&p))?;
++                let path = got["path"].as_str().unwrap_or_default();
++                match &p.append {
++                    None => p.append = path.rsplit(['/', '\\']).next().map(str::to_string),
++                    // A core from before `append` makes a new file instead.
++                    Some(_) if r["path"] != got["path"] => {
++                        return Err(RpcError::new(
++                            "unsupported",
++                            format!("{} took only the first part of {local}", p.terminal),
++                            "update hc on that machine (`hc machine update`), then send it again",
++                        ));
++                    }
++                    Some(_) => {}
++                }
++                r = got;
++                if piece.len() < crate::put::MAX_BYTES {
++                    break;
++                }
++            }
+             let human = r["path"].as_str().unwrap_or_default().to_string();
+             Out { json: r, human }
+         }
+diff --git a/crates/herdr-core/src/config.rs b/crates/herdr-core/src/config.rs
+index c41836b..c380227 100644
+--- a/crates/herdr-core/src/config.rs
++++ b/crates/herdr-core/src/config.rs
+@@ -32,6 +32,9 @@ pub struct Config {
+     /// timeout on top), and to send anything at all before its line is
+     /// given up and dialed again (default 30).
+     pub machine_timeout: Option<f64>,
++    /// The folder every `hc put` file lands in, and stays in (default: a
++    /// folder per terminal in the state dir, removed with the terminal).
++    pub drop_dir: Option<String>,
+ }
+ 
+ fn seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+@@ -67,6 +70,14 @@ impl Config {
+         std::time::Duration::from_secs_f64(self.machine_timeout.filter(|s| s.is_finite() && *s > 0.0).unwrap_or(30.0))
+     }
+ 
++    pub fn drop_dir(&self) -> Result<Option<std::path::PathBuf>, RpcError> {
++        match &self.drop_dir {
++            None => Ok(None),
++            Some(dir) if Path::new(dir).is_absolute() => Ok(Some(dir.into())),
++            Some(dir) => Err(invalid(format!("drop_dir {dir:?}: give a whole path, like \"/home/me/file-drop\""))),
++        }
++    }
++
+     pub fn history_bytes(&self) -> usize {
+         (self.history_mb.unwrap_or(5.0).max(0.0) * 1024.0 * 1024.0) as usize
+     }
+diff --git a/crates/herdr-core/src/put.rs b/crates/herdr-core/src/put.rs
+index ab34c07..8e02dc8 100644
+--- a/crates/herdr-core/src/put.rs
++++ b/crates/herdr-core/src/put.rs
+@@ -47,10 +47,21 @@ fn clean(name: &str) -> String {
+     if safe.is_empty() { "file".into() } else { safe }
+ }
+ 
+-/// Writes `bytes` as `name` (or `name-2.ext`, ... when taken) beside terminal `id`.
+-pub fn stage(state: &Path, id: u32, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+-    let dir = dir(state, id);
+-    std::fs::create_dir_all(&dir)?;
++/// Adds `bytes` to the end of `name`, a file an earlier put wrote in `dir`;
++/// its path and its size now.
++pub fn append(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<(PathBuf, u64)> {
++    if clean(name) != name {
++        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a name a put returned"));
++    }
++    let path = dir.join(name);
++    let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
++    std::io::Write::write_all(&mut f, bytes)?;
++    Ok((path, f.metadata()?.len()))
++}
++
++/// Writes `bytes` as `name` (or `name-2.ext`, ... when taken) in `dir`.
++pub fn stage(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
++    std::fs::create_dir_all(dir)?;
+     let name = clean(name);
+     let (stem, ext) = match name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()) {
+         Some((stem, ext)) => (stem.to_string(), format!(".{ext}")),
+diff --git a/crates/herdr-core/tests/put.rs b/crates/herdr-core/tests/put.rs
+index d897ee8..cb9c03d 100644
+--- a/crates/herdr-core/tests/put.rs
++++ b/crates/herdr-core/tests/put.rs
+@@ -32,15 +32,33 @@ fn a_file_lands_beside_the_terminal_keeps_its_name_and_goes_with_it() {
+     s.json(&["rm", &here]);
+     assert!(!std::path::Path::new(path).exists(), "removed with the terminal");
+ 
+-    std::fs::write(&file, vec![0u8; 9 << 20]).unwrap();
+-    assert_eq!(
+-        s.err(&["--json", "put", &there, file.to_str().unwrap()]).1["error"]["kind"],
+-        "invalid_params",
+-        "too big"
+-    );
+-    // Too big even to carry to rohan: refused here, and the line lives on.
+-    std::fs::write(&file, vec![0u8; 13 << 20]).unwrap();
+-    assert_eq!(s.err(&["--json", "put", &there, file.to_str().unwrap()]).1["error"]["kind"], "invalid_params");
+-    std::fs::write(&file, b"small").unwrap();
+-    s.json(&["put", &there, file.to_str().unwrap()]);
++    // Any size goes the same way: in pieces, whole on arrival, one path.
++    for size in [0, 8 << 20, 20 << 20] {
++        let big: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
++        std::fs::write(&file, &big).unwrap();
++        let got = s.json(&["put", &there, file.to_str().unwrap()]);
++        assert_eq!(got["bytes"].as_u64(), Some(size as u64), "{got}");
++        assert!(std::fs::read(got["path"].as_str().unwrap()).unwrap() == big, "{size} bytes arrive whole");
++    }
++}
++
++#[test]
++fn drop_dir_takes_every_file_and_keeps_it() {
++    let s = Session::new();
++    let drop = s.root.join("file-drop");
++    std::fs::create_dir_all(s.root.join("config/herdr-core")).unwrap();
++    std::fs::write(
++        s.root.join("config/herdr-core/config.toml"),
++        format!("drop_dir = {:?}\n", drop.display().to_string()),
++    )
++    .unwrap();
++    let file = s.root.join("claims.csv");
++    std::fs::write(&file, b"a,b\n1,2\n").unwrap();
++
++    let t = run(&s, &["sleep", "100"]);
++    let got = s.json(&["put", &t, file.to_str().unwrap()]);
++    assert_eq!(got["path"].as_str().unwrap(), drop.join("claims.csv").display().to_string(), "{got}");
++    s.json(&["kill", &t]);
++    s.json(&["rm", &t]);
++    assert!(drop.join("claims.csv").exists(), "kept after its terminal is gone");
+ }
+diff --git a/docs/machines.md b/docs/machines.md
+index b128a8f..c8dace0 100644
+--- a/docs/machines.md
++++ b/docs/machines.md
+@@ -148,7 +148,7 @@ hc file write --on box /srv/app/note.txt < note.txt
+ Write replaces the whole file and creates parent folders.
+ Edit requires the old text exactly once. Add context if it is missing or repeated.
+ Repeat old/new pairs for several edits; all succeed or none do.
+-`hc put box/build ./report.txt` sends a local file beside that terminal and prints where it landed.
++`hc put box/build ./report.txt` sends a local file beside that terminal and prints where it landed. Any size works: it goes in pieces of at most 8 MB, joined there. To have every file land in one folder that keeps them, set `drop_dir = "/home/me/file-drop"` in that machine's `~/.config/herdr-core/config.toml`.
+ 
+ ## When something goes wrong
+ 
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index bcc8876..1054a2a 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -687,6 +687,7 @@
+       "PutResult": {
+         "properties": {
+           "bytes": {
++            "description": "Its size there now.",
+             "format": "uint",
+             "minimum": 0,
+             "type": "integer"
+@@ -2964,11 +2965,23 @@
+       "paramStructure": "by-name",
+       "params": [
+         {
+-          "description": "Its bytes, base64; at most 8 MB raw.",
++          "description": "Add the bytes to the end of this file instead: the file name an earlier\nput to this terminal returned.",
++          "name": "append",
++          "required": false,
++          "schema": {
++            "description": "Add the bytes to the end of this file instead: the file name an earlier\nput to this terminal returned.",
++            "type": [
++              "string",
++              "null"
++            ]
++          }
++        },
++        {
++          "description": "Its bytes, base64; at most 8 MB raw per call (`hc put` sends a bigger\nfile in pieces).",
+           "name": "data",
+           "required": true,
+           "schema": {
+-            "description": "Its bytes, base64; at most 8 MB raw.",
++            "description": "Its bytes, base64; at most 8 MB raw per call (`hc put` sends a bigger\nfile in pieces).",
+             "type": "string"
+           }
+         },
+-- 
+2.54.0 (Apple Git-157)
+
