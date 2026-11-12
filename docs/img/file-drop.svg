@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="500" viewBox="0 0 1100 500" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif">
-  <title>File drop to a remote terminal: stock vs sheperd</title>
+  <title>File drop to a remote terminal: stock vs shepherd</title>
   <defs>
     <g id="file">
       <path d="M2 1h16l8 8v26a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V3a2 2 0 0 1 2-2z" fill="#ffffff" stroke="#8a8984" stroke-width="1.4"/>
@@ -65,7 +65,7 @@
   <line x1="40" y1="238" x2="1060" y2="238" stroke="#e3e1dc"/>
 
   <!-- ================= CUSTOM ================= -->
-  <text x="40" y="276" font-size="15" font-weight="700" fill="#1f1f1d">With sheperd</text>
+  <text x="40" y="276" font-size="15" font-weight="700" fill="#1f1f1d">With shepherd</text>
 
   <g transform="translate(40 292)">
     <rect x="0.5" y="0.5" width="250" height="110" rx="10" fill="#ffffff" stroke="#e3e1dc"/>
