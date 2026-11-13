@@ -1,0 +1,122 @@
+From bb85743c491ef2e5c8175c92ea5214a1f4b4b3c3 Mon Sep 17 00:00:00 2001
+From: Miller Bath <millerzbath@gmail.com>
+Date: Thu, 12 Nov 2026 12:04:00 -0600
+Subject: [PATCH 3/3] feat: hc put --progress says where the item lands
+
+Each progress line after the first piece has "path": the file there, or
+the new folder's root, so an app that cancels a send can remove what
+already arrived.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/herdr-core/src/cli.rs   | 41 ++++++++++++++++++++++------------
+ crates/herdr-core/tests/put.rs |  4 ++++
+ 2 files changed, 31 insertions(+), 14 deletions(-)
+
+diff --git a/crates/herdr-core/src/cli.rs b/crates/herdr-core/src/cli.rs
+index 72ef2aa..5462646 100644
+--- a/crates/herdr-core/src/cli.rs
++++ b/crates/herdr-core/src/cli.rs
+@@ -481,9 +481,9 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
+                 put_folder(&call, p, &local)?
+             } else {
+                 let (total, shown, progress) = (meta.len(), file_name(&local), p.progress);
+-                put_file(&call, &mut p, &local, &mut |sent| {
++                put_file(&call, &mut p, &local, &mut |sent, there| {
+                     if progress {
+-                        progress_line(sent, total, &shown);
++                        progress_line(sent, total, &shown, there);
+                     }
+                 })?
+             };
+@@ -641,19 +641,30 @@ fn file_name(path: &std::path::Path) -> String {
+ }
+ 
+ /// `hc put --progress`: one line on stderr per piece, for the whole file or
+-/// folder being sent (`sent` of `total` bytes) and the file in it now.
+-fn progress_line(sent: u64, total: u64, file: &str) {
+-    eprintln!("{}", json!({"progress": {"sent": sent, "total": total, "file": file}}));
++/// folder being sent (`sent` of `total` bytes), the file in it now, and where
++/// it lands there (`path`, once known), so a cancelled send can be removed.
++fn progress_line(sent: u64, total: u64, file: &str, path: &str) {
++    let mut line = json!({"sent": sent, "total": total, "file": file});
++    if !path.is_empty() {
++        line["path"] = json!(path);
++    }
++    eprintln!("{}", json!({ "progress": line }));
+ }
+ 
+ /// Sends the file at `local` in pieces of at most MAX_BYTES, one call each:
+ /// the first makes the file, the rest add to its end. `sent` hears the bytes
+-/// sent so far: 0 first, then after each piece.
+-fn put_file(call: &Call, p: &mut PutParams, local: &std::path::Path, sent: &mut dyn FnMut(u64)) -> Result<Value, RpcError> {
++/// sent so far and the file's path there ("" until the first piece lands):
++/// 0 first, then after each piece.
++fn put_file(
++    call: &Call,
++    p: &mut PutParams,
++    local: &std::path::Path,
++    sent: &mut dyn FnMut(u64, &str),
++) -> Result<Value, RpcError> {
+     let mut file = std::fs::File::open(local).map_err(|e| unreadable(local, e))?;
+     p.append = None;
+     let (mut r, mut done) = (Value::Null, 0);
+-    sent(0);
++    sent(0, "");
+     loop {
+         let mut piece = Vec::new();
+         (&mut file).take(crate::put::MAX_BYTES as u64).read_to_end(&mut piece).map_err(|e| unreadable(local, e))?;
+@@ -677,7 +688,7 @@ fn put_file(call: &Call, p: &mut PutParams, local: &std::path::Path, sent: &mut
+             Some(_) => {}
+         }
+         done += piece.len() as u64;
+-        sent(done);
++        sent(done, got["path"].as_str().unwrap_or_default());
+         r = got;
+         if piece.len() < crate::put::MAX_BYTES {
+             break;
+@@ -704,9 +715,14 @@ fn put_folder(call: &Call, mut p: PutParams, local: &std::path::Path) -> Result<
+         p.fresh = root.is_none();
+         p.name = file.to_string_lossy().into_owned();
+         let shown = inside.to_string_lossy().into_owned();
+-        let got = put_file(call, &mut p, file, &mut |sent| {
++        let got = put_file(call, &mut p, file, &mut |sent, there| {
++            // The new folder there: the first file's path, less its place inside.
++            if path.is_empty() && !there.is_empty() {
++                let there = std::path::Path::new(there);
++                path = there.ancestors().nth(inside.components().count()).unwrap_or(there).display().to_string();
++            }
+             if progress {
+-                progress_line(before + sent, total, &shown);
++                progress_line(before + sent, total, &shown, &path);
+             }
+         })?;
+         let Some(used) = got["folder"].as_str() else {
+@@ -718,9 +734,6 @@ fn put_folder(call: &Call, mut p: PutParams, local: &std::path::Path) -> Result<
+         };
+         if root.is_none() {
+             root = used.split('/').next().map(str::to_string);
+-            // The new folder: the first file's path, less its place inside.
+-            let first = std::path::Path::new(got["path"].as_str().unwrap_or_default());
+-            path = first.ancestors().nth(inside.components().count()).unwrap_or(first).display().to_string();
+         }
+         before += len;
+     }
+diff --git a/crates/herdr-core/tests/put.rs b/crates/herdr-core/tests/put.rs
+index 8c978e9..3185df8 100644
+--- a/crates/herdr-core/tests/put.rs
++++ b/crates/herdr-core/tests/put.rs
+@@ -98,6 +98,10 @@ fn a_folder_goes_whole_into_a_new_folder_with_progress() {
+     assert!(sent.windows(2).all(|w| w[0] <= w[1]) && sent.last() == Some(&total), "{sent:?}");
+     assert!(lines.iter().all(|l| l["progress"]["total"].as_u64() == Some(total)));
+     assert!(lines.iter().any(|l| l["progress"]["file"] == "photos/site 1/roof.jpg"));
++    // Where it lands, from the first piece on, for a cancel to remove.
++    let root = drop.join("rom_data").display().to_string();
++    assert!(lines[0]["progress"].get("path").is_none(), "{}", lines[0]);
++    assert!(lines[1..].iter().all(|l| l["progress"]["path"] == root.as_str()), "{lines:?}");
+ 
+     let again = s.json(&["put", &t, src.to_str().unwrap()]);
+     assert_eq!(again["path"].as_str().unwrap(), drop.join("rom_data-2").display().to_string(), "never mixed: {again}");
+-- 
+2.54.0 (Apple Git-157)
+

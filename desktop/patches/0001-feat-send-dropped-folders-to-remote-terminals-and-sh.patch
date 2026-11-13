@@ -1,0 +1,472 @@
+From 57cb90c00748ad21aac46d31c2f775eba3fa956d Mon Sep 17 00:00:00 2001
+From: Miller Bath <millerzbath@gmail.com>
+Date: Thu, 12 Nov 2026 11:39:33 -0600
+Subject: [PATCH 1/2] feat: send dropped folders to remote terminals and show
+ each transfer
+
+Files and folders dropped on another machine's terminal go one at a time
+with hc put --progress; a card over the pane lists them (queued, a bar
+with %, done or failed) and goes 10 s after the last one. An hc without
+--progress still sends files, without the %.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/terminal.rs          |  81 +++++++----
+ src/terminal/transfer.rs | 307 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 363 insertions(+), 25 deletions(-)
+ create mode 100644 src/terminal/transfer.rs
+
+diff --git a/src/terminal.rs b/src/terminal.rs
+index b707ea2..270ce8f 100644
+--- a/src/terminal.rs
++++ b/src/terminal.rs
+@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
+ use std::rc::Rc;
+ use std::sync::Arc;
+ 
++mod transfer;
++
+ const OUTPUT_TIME_PER_TURN: Duration = Duration::from_millis(6);
+ 
+ fn output_turn(
+@@ -153,6 +155,8 @@ pub struct TerminalView {
+     attach_deadline: Instant,
+     _render_hold: Option<(Instant, Task<()>)>,
+     _reader: Option<Task<()>>,
++    /// Files and folders on their way to this terminal's machine.
++    transfers: transfer::Transfers,
+ }
+ 
+ thread_local! {
+@@ -306,6 +310,7 @@ impl TerminalView {
+             attach_deadline,
+             _render_hold: None,
+             _reader: None,
++            transfers: transfer::Transfers::default(),
+         };
+         view.connect(core, cx);
+         view
+@@ -651,34 +656,58 @@ impl TerminalView {
+         self.put_there(paths, false, cx);
+     }
+ 
+-    /// Copies files to this terminal's machine (`hc put`) and pastes their
+-    /// paths there; `copies`: the local files were only for sending.
+-    fn put_there(&self, paths: Vec<std::path::PathBuf>, copies: bool, cx: &mut Context<Self>) {
++    /// Copies files and folders to this terminal's machine (`hc put`), one at
++    /// a time, and pastes each one's path there when it arrives. The card over
++    /// the pane shows them; `copies`: the local files were only for sending.
++    fn put_there(&mut self, paths: Vec<std::path::PathBuf>, copies: bool, cx: &mut Context<Self>) {
++        self.transfers.queue(paths, copies);
++        cx.notify();
++        if std::mem::replace(&mut self.transfers.sending, true) {
++            return;
++        }
+         let addr = self.address.clone();
+         cx.spawn(async move |this, cx| {
+-            let there = cx
+-                .background_executor()
+-                .spawn(async move {
+-                    paths
+-                        .iter()
+-                        .filter_map(|p| {
+-                            let out = crate::spawn::command(crate::core_bin::path()).args(["put", "--json", &addr]).arg(p).output();
+-                            if copies {
+-                                let _ = std::fs::remove_file(p);
+-                            }
+-                            let out = out.ok()?;
+-                            let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+-                            v.get("path").and_then(|p| p.as_str()).map(str::to_owned)
+-                        })
+-                        .collect::<Vec<_>>()
+-                })
+-                .await;
+-            if !there.is_empty() {
+-                let _ = this.update(cx, |this, _| {
+-                    let bytes = this.grid.borrow().vt.paste_bytes(&quote_paths(there));
+-                    this.send(&bytes);
++            while let Some((i, path, copy)) = this.update(cx, |this, _| this.transfers.next()).ok().flatten() {
++                let (tx, rx) = async_channel::unbounded();
++                let to = addr.clone();
++                let job = cx.background_executor().spawn(async move {
++                    let mut last: Option<Instant> = None;
++                    let sent = transfer::put(&to, &path, |sent, total| {
++                        if last.is_none_or(|t| t.elapsed() >= transfer::TICK) || Some(sent) == total {
++                            last = Some(Instant::now());
++                            let _ = tx.try_send(transfer::State::Sending { sent, total });
++                        }
++                    });
++                    if copy {
++                        let _ = std::fs::remove_file(&path);
++                    }
++                    sent
++                });
++                while let Ok(state) = rx.recv().await {
++                    let _ = this.update(cx, |this, cx| {
++                        this.transfers.set(i, state);
++                        cx.notify();
++                    });
++                }
++                let sent = job.await;
++                let _ = this.update(cx, |this, cx| {
++                    match sent {
++                        Ok(there) => {
++                            let bytes = this.grid.borrow().vt.paste_bytes(&quote_paths([there]));
++                            this.send(&bytes);
++                            this.transfers.set(i, transfer::State::Done);
++                        }
++                        Err(why) => this.transfers.set(i, transfer::State::Failed(why)),
++                    }
++                    cx.notify();
+                 });
+             }
++            let Ok(generation) = this.update(cx, |this, _| this.transfers.generation) else { return };
++            cx.background_executor().timer(transfer::LINGER).await;
++            let _ = this.update(cx, |this, cx| {
++                this.transfers.hide(generation);
++                cx.notify();
++            });
+         })
+         .detach();
+     }
+@@ -712,7 +741,7 @@ impl TerminalView {
+     /// An agent on another machine reads that machine's clipboard, so this
+     /// one's image goes there as a file, and its path is pasted. A local
+     /// program reads the clipboard itself: nothing to do.
+-    fn send_image(&self, cx: &mut Context<Self>) -> bool {
++    fn send_image(&mut self, cx: &mut Context<Self>) -> bool {
+         if !self.address.contains('/') {
+             return false;
+         }
+@@ -2132,6 +2161,7 @@ impl Render for TerminalView {
+         let (input_focus, input_view) = (self.focus.clone(), cx.entity());
+         let ended = self.ended.clone().or_else(|| self.lost.then(|| "reconnecting to core…".to_owned()));
+         let search_input = self.search_open.then(|| self.search_input.clone()).flatten();
++        let transfers = transfer::card(&self.transfers, &self.address);
+         let search_progress = self.grid.borrow().vt.search_progress();
+         let search_label = if self.search_query.is_empty() {
+             String::new()
+@@ -2413,6 +2443,7 @@ impl Render for TerminalView {
+                         .child(format!("[{why}]")),
+                 )
+             })
++            .children(transfers)
+     }
+ }
+ 
+diff --git a/src/terminal/transfer.rs b/src/terminal/transfer.rs
+new file mode 100644
+index 0000000..e6005ec
+--- /dev/null
++++ b/src/terminal/transfer.rs
+@@ -0,0 +1,307 @@
++//! Files and folders dropped on another machine's terminal: sent there one at
++//! a time (`hc put --progress`), and what each is doing, for the card over the pane.
++
++use gpui::prelude::FluentBuilder as _;
++use gpui::*;
++use std::io::{BufRead, BufReader};
++use std::path::{Path, PathBuf};
++use std::process::Stdio;
++use std::time::Duration;
++
++/// How long the card stays after the last item is sent.
++pub const LINGER: Duration = Duration::from_secs(10);
++/// The fastest the card redraws for progress.
++pub const TICK: Duration = Duration::from_millis(100);
++
++#[derive(Clone, Debug, PartialEq)]
++pub enum State {
++    Queued,
++    /// `total` is unknown until hc reports it (an hc without `--progress` never does).
++    Sending { sent: u64, total: Option<u64> },
++    Done,
++    Failed(String),
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct Item {
++    pub name: String,
++    pub folder: bool,
++    pub state: State,
++    path: PathBuf,
++    /// The local file was only made for sending (a pasted image): removed after.
++    copy: bool,
++}
++
++/// One terminal's drops, oldest first.
++#[derive(Default)]
++pub struct Transfers {
++    pub items: Vec<Item>,
++    /// A task sends the queue now.
++    pub sending: bool,
++    /// Bumped by each drop, so an older drop's wait doesn't hide a newer one.
++    pub generation: u64,
++}
++
++impl Transfers {
++    /// Adds a drop's items after those still going; a finished list starts over.
++    pub fn queue(&mut self, paths: Vec<PathBuf>, copy: bool) {
++        if !self.busy() {
++            self.items.clear();
++        }
++        self.generation += 1;
++        self.items.extend(paths.into_iter().map(|path| Item {
++            name: if copy { "pasted image".to_owned() } else { path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned() },
++            folder: path.is_dir(),
++            state: State::Queued,
++            path,
++            copy,
++        }));
++    }
++
++    /// The next queued item, now sending; none: the sending task stops.
++    pub fn next(&mut self) -> Option<(usize, PathBuf, bool)> {
++        let Some(i) = self.items.iter().position(|item| item.state == State::Queued) else {
++            self.sending = false;
++            return None;
++        };
++        let item = &mut self.items[i];
++        item.state = State::Sending { sent: 0, total: None };
++        Some((i, item.path.clone(), item.copy))
++    }
++
++    pub fn set(&mut self, i: usize, state: State) {
++        if let Some(item) = self.items.get_mut(i) {
++            item.state = state;
++        }
++    }
++
++    pub fn busy(&self) -> bool {
++        self.items.iter().any(|i| matches!(i.state, State::Queued | State::Sending { .. }))
++    }
++
++    /// After the wait: hides the card unless another drop came meanwhile.
++    pub fn hide(&mut self, generation: u64) {
++        if self.generation == generation && !self.busy() {
++            self.items.clear();
++        }
++    }
++}
++
++/// One line `hc put --progress` writes to stderr.
++#[derive(Debug, PartialEq)]
++pub enum Line {
++    Progress { sent: u64, total: u64 },
++    Error(String),
++    Text(String),
++}
++
++pub fn parse_line(line: &str) -> Line {
++    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
++    if let Some(p) = v.get("progress") {
++        return Line::Progress { sent: p["sent"].as_u64().unwrap_or(0), total: p["total"].as_u64().unwrap_or(0) };
++    }
++    if let Some(message) = v["error"]["message"].as_str() {
++        return Line::Error(match v["error"]["hint"].as_str().filter(|h| !h.is_empty()) {
++            Some(hint) => format!("{message} ({hint})"),
++            None => message.to_owned(),
++        });
++    }
++    Line::Text(line.trim().to_owned())
++}
++
++/// hc's answer: the path there, else its last error, else its first line of text.
++pub fn answer(stdout: &[u8], lines: &[Line]) -> Result<String, String> {
++    let v: serde_json::Value = serde_json::from_slice(stdout).unwrap_or_default();
++    if let Some(path) = v["path"].as_str() {
++        return Ok(path.to_owned());
++    }
++    let error = lines.iter().rev().find_map(|l| if let Line::Error(e) = l { Some(e.clone()) } else { None });
++    let text = || lines.iter().find_map(|l| if let Line::Text(t) = l { Some(t.clone()).filter(|t| !t.is_empty()) } else { None });
++    Err(error.or_else(text).unwrap_or_else(|| "hc put gave no path".to_owned()))
++}
++
++/// Sends `path` to the machine of terminal `addr`, reporting (sent, total) as
++/// it goes. An hc from before `--progress` sends it without.
++pub fn put(addr: &str, path: &Path, mut progress: impl FnMut(u64, Option<u64>)) -> Result<String, String> {
++    match run(addr, path, true, &mut progress) {
++        Err(why) if why.contains("--progress") => {
++            progress(0, None);
++            run(addr, path, false, &mut progress)
++        }
++        sent => sent,
++    }
++}
++
++fn run(addr: &str, path: &Path, with_progress: bool, progress: &mut impl FnMut(u64, Option<u64>)) -> Result<String, String> {
++    let mut cmd = crate::spawn::command(crate::core_bin::path());
++    cmd.args(["put", "--json"]);
++    if with_progress {
++        cmd.arg("--progress");
++    }
++    cmd.arg(addr).arg(path).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
++    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
++    let mut lines = Vec::new();
++    if let Some(stderr) = child.stderr.take() {
++        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
++            match parse_line(&line) {
++                Line::Progress { sent, total } => progress(sent, Some(total)),
++                other => lines.push(other),
++            }
++        }
++    }
++    let out = child.wait_with_output().map_err(|e| e.to_string())?;
++    answer(&out.stdout, &lines)
++}
++
++/// The card over the pane: one row per item, the one sending with a bar.
++pub fn card(transfers: &Transfers, address: &str) -> Option<AnyElement> {
++    if transfers.items.is_empty() {
++        return None;
++    }
++    let color = crate::settings::color;
++    let machine = address.split_once('/').map_or(address, |(m, _)| m);
++    let count = transfers.items.len();
++    let done = transfers.items.iter().filter(|i| i.state == State::Done).count();
++    let failed = transfers.items.iter().filter(|i| matches!(i.state, State::Failed(_))).count();
++    let title = if transfers.busy() {
++        let at = done + failed + 1;
++        format!("Sending {at} of {count} to {machine}")
++    } else if failed == 0 {
++        format!("Sent {count} to {machine}")
++    } else {
++        format!("Sent {done} of {count} to {machine}")
++    };
++    let rows = transfers.items.iter().map(|item| {
++        let name = if item.folder { format!("{}/", item.name) } else { item.name.clone() };
++        let (mark, mark_color) = match &item.state {
++            State::Queued => ("Queued".to_owned(), color("muted")),
++            State::Sending { sent, total: Some(total) } if *total > 0 => (format!("{}%", sent * 100 / total), color("foreground")),
++            State::Sending { .. } => ("…".to_owned(), color("muted")),
++            State::Done => ("✓".to_owned(), color("done")),
++            State::Failed(_) => ("✕".to_owned(), color("blocked")),
++        };
++        let bar = match item.state {
++            State::Sending { sent, total: Some(total) } if total > 0 => Some((sent as f32 / total as f32).clamp(0.0, 1.0)),
++            State::Sending { .. } => Some(1.0),
++            _ => None,
++        };
++        let known = matches!(item.state, State::Sending { total: Some(t), .. } if t > 0);
++        div()
++            .flex()
++            .flex_col()
++            .gap(px(3.0))
++            .child(
++                div()
++                    .flex()
++                    .items_center()
++                    .gap_2()
++                    .child(div().flex_1().min_w_0().truncate().text_color(color("foreground")).child(name))
++                    .child(div().flex_none().text_color(mark_color).child(mark)),
++            )
++            .when_some(bar, |d, fraction| {
++                d.child(
++                    div().h(px(3.0)).w_full().rounded_full().bg(color("border")).child(
++                        div().h_full().rounded_full().w(relative(fraction)).bg(color("accent")).when(!known, |d| d.opacity(0.35)),
++                    ),
++                )
++            })
++            .when_some(if let State::Failed(why) = &item.state { Some(why.clone()) } else { None }, |d, why| {
++                d.child(div().truncate().text_color(color("muted")).child(why))
++            })
++    });
++    Some(
++        div()
++            .id(SharedString::from(format!("transfers-{address}")))
++            .debug_selector(|| "transfers".to_owned())
++            .absolute()
++            .bottom_3()
++            .right_3()
++            .w(px(280.0))
++            .flex()
++            .flex_col()
++            .gap_2()
++            .p_2()
++            .rounded_md()
++            .border_1()
++            .border_color(color("border"))
++            .bg(color("popover"))
++            .shadow_md()
++            .text_xs()
++            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
++            .child(div().text_color(color("muted")).child(title))
++            .children(rows)
++            .into_any_element(),
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{Line, State, Transfers, answer, parse_line};
++    use std::path::PathBuf;
++
++    #[test]
++    fn progress_error_and_text_lines_are_told_apart() {
++        assert_eq!(parse_line(r#"{"progress":{"sent":8388608,"total":30000000,"file":"a/b.bin"}}"#), Line::Progress { sent: 8388608, total: 30000000 });
++        assert_eq!(parse_line(r#"{"progress":{"sent":0,"total":0,"file":"empty"}}"#), Line::Progress { sent: 0, total: 0 });
++        assert_eq!(
++            parse_line(r#"{"error":{"kind":"unsupported","message":"box took only the first part","hint":"update hc"}}"#),
++            Line::Error("box took only the first part (update hc)".to_owned())
++        );
++        assert_eq!(parse_line(r#"{"error":{"kind":"usage","message":"cannot read x","hint":""}}"#), Line::Error("cannot read x".to_owned()));
++        assert_eq!(parse_line("error: unexpected argument '--progress' found  "), Line::Text("error: unexpected argument '--progress' found".to_owned()));
++    }
++
++    #[test]
++    fn the_answer_is_the_path_else_the_last_error_else_text() {
++        let lines = vec![Line::Error("first".into()), Line::Text("noise".into()), Line::Error("last".into())];
++        assert_eq!(answer(br#"{"path":"/home/me/file-drop/a.csv","bytes":20}"#, &lines), Ok("/home/me/file-drop/a.csv".to_owned()));
++        assert_eq!(answer(b"", &lines), Err("last".to_owned()));
++        assert_eq!(answer(b"", &[Line::Text(String::new()), Line::Text("error: no such terminal".into())]), Err("error: no such terminal".to_owned()));
++        assert_eq!(answer(b"", &[]), Err("hc put gave no path".to_owned()));
++    }
++
++    #[test]
++    fn items_go_one_at_a_time_and_a_finished_list_starts_over() {
++        let mut t = Transfers::default();
++        t.queue(vec!["/a/one.csv".into(), "/a/two.bin".into()], false);
++        assert_eq!(t.items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["one.csv", "two.bin"]);
++        let (first, path, copy) = t.next().unwrap();
++        assert_eq!((first, path, copy), (0, PathBuf::from("/a/one.csv"), false));
++        assert_eq!(t.items[0].state, State::Sending { sent: 0, total: None });
++        assert_eq!(t.items[1].state, State::Queued, "one at a time");
++
++        // A drop while sending joins the queue.
++        t.queue(vec!["/b/three.txt".into()], false);
++        assert_eq!(t.items.len(), 3);
++        t.set(0, State::Done);
++        assert_eq!(t.next().map(|n| n.0), Some(1));
++        t.set(1, State::Failed("no space".into()));
++        assert_eq!(t.next().map(|n| n.0), Some(2));
++        t.set(2, State::Done);
++        t.sending = true;
++        assert_eq!(t.next(), None);
++        assert!(!t.sending, "the sending task stops when nothing is queued");
++        assert!(!t.busy());
++
++        // The next drop starts a new list.
++        t.queue(vec!["/c/four.png".into()], true);
++        assert_eq!(t.items.len(), 1);
++        assert_eq!(t.items[0].name, "pasted image");
++    }
++
++    #[test]
++    fn the_wait_hides_the_card_only_if_no_drop_came_meanwhile() {
++        let mut t = Transfers::default();
++        t.queue(vec!["/a/one.csv".into()], false);
++        let old = t.generation;
++        t.next();
++        t.set(0, State::Done);
++        t.queue(vec!["/a/two.csv".into()], false);
++        t.hide(old);
++        assert_eq!(t.items.len(), 1, "a newer drop keeps the card");
++        t.next();
++        t.set(0, State::Done);
++        t.hide(t.generation);
++        assert!(t.items.is_empty());
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+
