@@ -39,6 +39,11 @@ narrow window, then the strip scrolls), line 1 13 px (600 when active), line 2
 11.5 px muted. The code is `lines()` and `step()` at the top of
 `mods/titled-tabs/main.js`.
 
+Scroll on the tab strip: a mouse wheel switches one tab per notch. A trackpad
+swipe up or down switches one tab, however long the swipe and its momentum (stock
+Herdr switches one tab for each trackpad event, so the tabs fly past). A
+sideways swipe only scrolls the strip. The code is `wheel()`.
+
 ## Files
 
 - `mods/titled-tabs/`: a clone of the built-in `tabs` mod (Herdr 0.1.15) with

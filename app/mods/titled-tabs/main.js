@@ -20,6 +20,9 @@ const words = (s) => {
 
 const REMEMBERED = 200;
 
+// Vertical travel, in px, that one trackpad swipe needs to switch one tab.
+const SWIPE_PX = 40;
+
 // A title that says what the work is: not a path, a user@host, or the program's own name.
 function telling(raw, prog) {
   const live = clean(raw);
@@ -75,6 +78,26 @@ export default class Tabs extends View {
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
     this.saved = localStorage.getItem("seen") ?? "{}";
     this.seen = JSON.parse(this.saved);
+    this.swipe = null;
+  }
+
+  // A mouse wheel switches one tab per notch. A trackpad swipe switches at most
+  // one tab: it sends many events, then momentum events after "ended", which
+  // stock Herdr turned into one tab each. A sideways swipe only scrolls the strip.
+  wheel(e) {
+    const notch = e.delta_lines;
+    if (notch) {
+      if (Math.abs(notch.y) > Math.abs(notch.x) && Math.abs(notch.y) >= 1) run(notch.y > 0 ? "tab.prev" : "tab.next");
+      return;
+    }
+    if (e.touch_phase === "started") { this.swipe = { x: 0, y: 0, done: false }; return; }
+    if (e.touch_phase !== "moved") { this.swipe = null; return; }
+    const g = this.swipe;
+    if (!g || g.done) return;
+    g.x += e.delta.x; g.y += e.delta.y;
+    if (Math.abs(g.x) >= Math.abs(g.y) || Math.abs(g.y) < SWIPE_PX) return;
+    g.done = true;
+    run(g.y > 0 ? "tab.prev" : "tab.next");
   }
 
   // Keeps what lines() learned, newest REMEMBERED terminals only.
@@ -184,7 +207,7 @@ export default class Tabs extends View {
     this.saveSeen();
     return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
-      .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
+      .on_scroll_wheel(e => this.wheel(e))
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().track_scroll(this.scroll)
         .on_size_change((_size, cx) => { if (active >= 0) { this.scroll.scroll_to_item(active); cx.notify(); } })
         .children(items))
