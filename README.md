@@ -1,4 +1,4 @@
-# sheperd
+# shepherd
 
 **Two upgrades to [Herdr](https://github.com/herdrdev) for people who run many
 AI agents and remote terminals at the same time.**
@@ -11,11 +11,11 @@ AI agents and remote terminals at the same time.**
 Both are small add-ons on top of the official Herdr releases (a mod and one
 patch), not a fork. You can go back to stock Herdr with two commands.
 
-![Stock Herdr tabs all say "Claude". With sheperd, each tab shows its task and what the agent does now.](docs/img/tabs.svg)
+![Stock Herdr tabs all say "Claude". With shepherd, each tab shows its task and what the agent does now.](docs/img/tabs.svg)
 
 ## At a glance
 
-|  | Stock Herdr | With sheperd |
+|  | Stock Herdr | With shepherd |
 |---|---|---|
 | Tab label | The program name: "Claude", "Claude", "Claude" | The task, then what the agent does now |
 | Find the agent you want | Click each tab | Read the tab bar |
@@ -28,7 +28,7 @@ When you run five Claude Code agents, stock Herdr shows five tabs with the
 same name. To find the agent that fixes the login bug, you must click through
 them.
 
-With sheperd, each tab has two short lines:
+With shepherd, each tab has two short lines:
 
 ```
 ✳ Fix the login redirect loop        ← line 1: the task it started on
@@ -55,9 +55,9 @@ Herdr lets you drag a file from your Mac onto a terminal that runs on another
 machine. In stock Herdr, files over 8 MB fail, and the file goes to a hidden
 folder that Herdr deletes when the terminal closes.
 
-![Stock Herdr: a 30 MB drop fails. sheperd: hc sends it in 8 MB pieces and it lands in ~/file-drop.](docs/img/file-drop.svg)
+![Stock Herdr: a 30 MB drop fails. shepherd: hc sends it in 8 MB pieces and it lands in ~/file-drop.](docs/img/file-drop.svg)
 
-With sheperd:
+With shepherd:
 
 - **Any size.** `hc` sends the file in 8 MB pieces, and the remote end joins
   them into one file. Screen recordings, data exports and logs all work.
@@ -85,7 +85,7 @@ You need Herdr Desktop 0.1.15 or later on a Mac. To build `hc`, you need
 Rust 1.95 and Zig 0.16.
 
 ```sh
-git clone https://github.com/bath/sheperd && cd sheperd
+git clone https://github.com/bath/shepherd && cd shepherd
 
 app/install.sh        # Tabs: install the mod and layout in Herdr Desktop (Mac)
 core/build.sh         # File drop: build hc with the patch (prints the binary path)
